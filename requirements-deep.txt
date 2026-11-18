@@ -1,0 +1,7 @@
+# Optional dependencies for the --deep profile
+# (install CPU-only torch first to avoid a multi-GB CUDA download:
+#  pip install torch --index-url https://download.pytorch.org/whl/cpu)
+-r requirements.txt
+opencv-python-headless>=4.9
+playwright>=1.45
+sentence-transformers>=3.0
