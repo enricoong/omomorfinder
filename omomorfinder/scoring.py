@@ -2,7 +2,8 @@
 Explainable relevance index (0-100) and classification.
 
 Each signal adds (or removes) a fixed number of points and is recorded as a
-`ScoreItem`, so every score can be justified line by line in the report.
+`ScoreItem` (groups: lexical, registration, infra, reputation, content,
+subdomain), so every score can be justified line by line in the output.
 Classification is rule based and ordered: availability first, then
 defensive registrations (to avoid flagging the brand's own domains), then
 malicious evidence, parking, competitors and generic suspicion.
@@ -51,6 +52,26 @@ def risk_level(score: int) -> str:
         if score >= threshold:
             return name
     return "INFO"
+
+
+def top_reasons(c: Candidate, limit: int = 3) -> list[ScoreItem]:
+    """
+    The strongest reasons behind a score, for the "why" column.
+
+    Positive contributions come first (largest first); a defensive
+    reduction, when present, is always included because it explains a low
+    score on an otherwise suspicious-looking domain.
+
+    Args:
+        c (Candidate): Scored candidate.
+        limit (int): Maximum number of reasons.
+    Returns:
+        list[ScoreItem]: Selected contributions.
+    """
+    positive = sorted((i for i in c.breakdown if i.points > 0), key=lambda i: -i.points)
+    negative = [i for i in c.breakdown if i.points < 0]
+    picked = positive[: limit - (1 if negative else 0)] + negative[:1]
+    return picked[:limit]
 
 
 def normalise_org(org: str | None) -> str:
@@ -240,6 +261,18 @@ class Scorer:
             elif text_sim >= 0.35:
                 add("content", f"content similarity {text_sim:.0%}", 6)
 
+            # ---- subdomains ----------------------------------------------
+            brand_subs = [sd.name for sd in c.subdomains if sd.brand]
+            cred_subs = [sd.name for sd in c.subdomains if sd.credential and (sd.ips or sd.sources - {"dns"})]
+            if brand_subs:
+                more = f" (+{len(brand_subs) - 1} more)" if len(brand_subs) > 1 else ""
+                add("subdomain", f"brand used in subdomain {brand_subs[0]}{more}", 20)
+            if cred_subs:
+                more = f" (+{len(cred_subs) - 1} more)" if len(cred_subs) > 1 else ""
+                add("subdomain", f"credential-themed subdomain {cred_subs[0]}{more}", 6)
+            if c.wildcard_dns:
+                add("subdomain", "wildcard DNS: any subdomain resolves (used by phishing kits)", 3)
+
         defensive = self.defensive_reasons(c) if registered else []
         total = sum(i.points for i in items)
         if defensive:
@@ -273,8 +306,10 @@ class Scorer:
         brand = bool(page and page.brand_mentions)
         logo = bool(vis and (vis.favicon_match or vis.logo_similarity >= 0.9))
         text_sim = max(c.text_similarity, c.semantic_similarity or 0.0)
+        brand_sub = any(sd.brand for sd in c.subdomains)
         if c.feeds or (c.vt and c.vt.malicious >= 2) or (c.urlscan and c.urlscan.malicious) \
-                or (login and (brand or logo or text_sim >= 0.6)):
+                or (login and (brand or logo or text_sim >= 0.6 or brand_sub)) \
+                or (brand_sub and c.feed_subdomains):
             return "MALICIOUS"
         if not login and ((page and page.parked) or parking_nameservers(c.dns.ns)):
             return "PARKED"

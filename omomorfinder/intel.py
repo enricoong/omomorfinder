@@ -10,7 +10,7 @@ instead of hammering the service. All answers are cached.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .config import TTL, Settings
@@ -96,7 +96,7 @@ class VirusTotalClient:
             undetected=int(stats.get("undetected", 0)),
             reputation=int(attrs.get("reputation", 0) or 0),
             categories=sorted({str(v) for v in (attrs.get("categories") or {}).values()})[:6],
-            last_analysis=datetime.fromtimestamp(ts, timezone.utc) if isinstance(ts, (int, float)) else None,
+            last_analysis=datetime.fromtimestamp(ts, UTC) if isinstance(ts, (int, float)) else None,
         )
 
 

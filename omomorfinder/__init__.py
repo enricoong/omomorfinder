@@ -11,4 +11,6 @@ DEFENSIVE, AVAILABLE).
 """
 
 __app_name__ = "OmomorFinder"
-__version__ = "1.0.0"
+# Single source of truth for the version (read by pyproject.toml, --version,
+# the User-Agent and the JSON export). Bump it together with CHANGELOG.md.
+__version__ = "1.1.0"

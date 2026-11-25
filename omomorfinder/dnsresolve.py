@@ -19,6 +19,7 @@ import dns.asyncresolver
 import dns.exception
 import dns.resolver
 
+from . import activity
 from .cache import Cache
 from .config import TTL, Settings
 from .models import DnsInfo
@@ -54,6 +55,7 @@ class DnsResolver:
             except dns.resolver.NoResolverConfiguration:
                 self.resolver = dns.asyncresolver.Resolver(configure=False)
                 self.resolver.nameservers = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+        self.custom_resolvers = list(settings.resolvers)
         self.resolver.timeout = 2.5
         self.resolver.lifetime = 6.0
         self.cache = cache
@@ -103,6 +105,7 @@ class DnsResolver:
             return cached[0], cached[1]
         async with self._sem:
             self.queries += 1
+            activity.emit("dns", activity.dig_command(name, rdtype, self.custom_resolvers))
             try:
                 ans = await self.resolver.resolve(name, rdtype, raise_on_no_answer=False)
                 if ans.rrset is None:
@@ -126,13 +129,28 @@ class DnsResolver:
         """
         Detect TLDs that answer for any (even random) name.
 
-        The check runs once per suffix and is shared by concurrent callers.
-
         Args:
             suffix (str): Public suffix (ASCII).
         Returns:
             bool: True if a random 24-character label resolves.
         """
+        return await self.is_wildcard_zone(suffix)
+
+    async def is_wildcard_zone(self, zone: str) -> bool:
+        """
+        Detect zones (TLDs or domains) with a wildcard record ("*.zone").
+
+        A domain with wildcard DNS resolves every subdomain, so subdomain
+        probes on it prove nothing; phishing kits also use wildcards to
+        accept any "brand.login.<domain>" link. The check runs once per zone
+        and is shared by concurrent callers.
+
+        Args:
+            zone (str): Zone apex (ASCII), e.g. "com" or "example.com".
+        Returns:
+            bool: True if a random 24-character label resolves.
+        """
+        suffix = zone
         task = self._wildcards.get(suffix)
         if task is None:
             async def check() -> bool:

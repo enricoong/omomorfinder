@@ -3,24 +3,24 @@ Domain registration lookups: RDAP first, WHOIS (port 43) as fallback.
 
 RDAP (RFC 9082/9083) is mandatory for every ICANN gTLD and returns
 structured JSON; the right server is found through the IANA bootstrap
-file. Many ccTLDs still only offer WHOIS, so a raw asynchronous WHOIS
-client with IANA referral, thin-registry referral, section-aware parsing
-(e.g. the ".it" format) and strict per-server rate limiting is included.
+file. Many ccTLDs still only offer WHOIS: queries go through the polite
+`whois.WhoisClient` (adaptive pacing, budget, reachability probe); this
+module adds thin-registry referral and section-aware parsing (e.g. ".it").
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .cache import Cache
-from .config import TTL, WHOIS_RATE
+from .config import TTL
 from .models import RegistrationInfo
-from .net import HostLimiter, HttpClient
+from .net import HttpClient
 from .resources import ResourceManager
+from .whois import WhoisClient
 
 log = logging.getLogger(__name__)
 
@@ -82,12 +82,12 @@ def parse_date(value: Any) -> datetime | None:
     for cand in candidates:
         try:
             dt = datetime.fromisoformat(cand)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
         except ValueError:
             pass
         for fmt in _DATE_FORMATS:
             try:
-                return datetime.strptime(cand, fmt).replace(tzinfo=timezone.utc)
+                return datetime.strptime(cand, fmt).replace(tzinfo=UTC)
             except ValueError:
                 continue
     return None
@@ -282,42 +282,31 @@ def parse_whois(text: str, domain: str) -> RegistrationInfo:
 
 class RegistrationLookup:
     """
-    RDAP + WHOIS client with caching and per-server politeness.
+    Registration data for a domain: RDAP first, polite WHOIS as fallback.
 
     Args (constructor):
-        http (HttpClient): Shared HTTP client (RDAP).
-        cache (Cache): Shared cache (namespaces "whois", "whois_refer").
+        http (HttpClient): Shared HTTP client (RDAP and IANA pages).
+        cache (Cache): Shared cache.
         resources (ResourceManager): Provides the RDAP bootstrap map.
+        whois_budget (int): Max uncached WHOIS queries per server per scan.
     """
 
-    # Consecutive failures after which a WHOIS server is considered to be
-    # blocking us (rate limit / ban) and is skipped for the rest of the scan.
-    BREAKER_THRESHOLD = 3
-
     def __init__(self, http: HttpClient, cache: Cache, resources: ResourceManager,
-                 whois_budget: int = 80) -> None:
+                 whois_budget: int = 40) -> None:
         """
-        Store dependencies and prepare WHOIS limiters and circuit breakers.
+        Store dependencies and build the WHOIS client.
 
         Args:
             http (HttpClient): Shared HTTP client.
             cache (Cache): Shared cache.
             resources (ResourceManager): Dataset manager.
-            whois_budget (int): Maximum uncached queries per WHOIS server per
-                scan (registries such as whois.nic.it ban heavy clients).
+            whois_budget (int): WHOIS query budget per server.
         Returns:
             None
         """
         self.http = http
-        self.cache = cache
         self.resources = resources
-        self.whois_budget = whois_budget
-        self._whois_limiters: dict[str, HostLimiter] = {}
-        self._refer_locks: dict[str, asyncio.Lock] = {}
-        self._failures: dict[str, int] = {}
-        self._queries: dict[str, int] = {}
-        self.down: set[str] = set()
-        self.budget_hit: set[str] = set()
+        self.whois_client = WhoisClient(http, cache, whois_budget)
 
     async def lookup(self, domain: str, suffix: str) -> RegistrationInfo:
         """
@@ -383,139 +372,6 @@ class RegistrationLookup:
                     info.created = info.created or extra.created
         return info
 
-    def _limiter(self, server: str) -> HostLimiter:
-        """
-        Per-WHOIS-server limiter (WHOIS servers ban aggressively).
-
-        Args:
-            server (str): WHOIS hostname.
-        Returns:
-            HostLimiter: Limiter for that server.
-        """
-        lim = self._whois_limiters.get(server)
-        if lim is None:
-            lim = self._whois_limiters[server] = HostLimiter(WHOIS_RATE)
-        return lim
-
-    async def _raw_whois(self, server: str, query: str, timeout: float = 10.0) -> str | None:
-        """
-        Send one WHOIS query over TCP/43 with caching, a per-server query
-        budget and a circuit breaker (a server failing repeatedly is assumed
-        to be rate-limiting us and is skipped for the rest of the scan).
-
-        Args:
-            server (str): WHOIS server hostname.
-            query (str): Query string (domain or TLD).
-            timeout (float): Connect timeout and whole-read timeout, seconds.
-        Returns:
-            str | None: Raw response text, None on failure / skipped server.
-        """
-        key = Cache.make_key(server, query)
-        cached = self.cache.get_json("whois", key)
-        if cached is not None:
-            return cached
-        if server in self.down:
-            return None
-        if server != "whois.iana.org" and self._queries.get(server, 0) >= self.whois_budget:
-            self.budget_hit.add(server)
-            return None
-        async with self._limiter(server):
-            if server in self.down:  # tripped while we were queued
-                return None
-            self._queries[server] = self._queries.get(server, 0) + 1
-            text = await self._whois_exchange(server, query, timeout)
-        if text is None or (WHOIS_RATE_LIMITED.search(text[:600]) and len(text) < 600):
-            fails = self._failures[server] = self._failures.get(server, 0) + 1
-            if fails >= self.BREAKER_THRESHOLD and server not in self.down:
-                self.down.add(server)
-                log.info("WHOIS server %s stopped answering (rate limit?): skipped for this scan", server)
-            return None if text is None else text
-        self._failures[server] = 0
-        self.cache.set_json("whois", key, text, TTL["whois"])
-        return text
-
-    @staticmethod
-    async def _whois_exchange(server: str, query: str, timeout: float) -> str | None:
-        """
-        Perform the raw TCP/43 exchange (connect, send, read until EOF).
-
-        Args:
-            server (str): WHOIS server hostname.
-            query (str): Query line.
-            timeout (float): Timeout for connect and for the whole read.
-        Returns:
-            str | None: Decoded response, None when nothing was received.
-        """
-        chunks: list[bytes] = []
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(server, 43, happy_eyeballs_delay=0.25), timeout)
-        except (OSError, asyncio.TimeoutError) as exc:
-            log.debug("whois connect %s failed: %s", server, exc)
-            return None
-
-        async def read_all() -> None:
-            """
-            Read until EOF or until 256 KiB were received.
-
-            Returns:
-                None
-            """
-            total = 0
-            while total < 262_144:
-                chunk = await reader.read(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-
-        try:
-            writer.write(f"{query}\r\n".encode("ascii", "ignore"))
-            await writer.drain()
-            await asyncio.wait_for(read_all(), timeout)
-        except (OSError, asyncio.TimeoutError) as exc:
-            log.debug("whois read %s failed: %s", server, exc)
-        finally:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), 3)
-            except (OSError, asyncio.TimeoutError):
-                pass
-        raw = b"".join(chunks)
-        if not raw:
-            return None
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return raw.decode("latin-1", errors="replace")
-
-    async def whois_server(self, tld: str) -> str | None:
-        """
-        Discover the authoritative WHOIS server of a TLD via whois.iana.org.
-
-        Args:
-            tld (str): Top-level domain (ASCII).
-        Returns:
-            str | None: WHOIS hostname, None if the TLD has none.
-        """
-        key = Cache.make_key("refer", tld)
-        cached = self.cache.get_json("whois_refer", key)
-        if cached is not None:
-            return cached or None
-        lock = self._refer_locks.setdefault(tld, asyncio.Lock())
-        async with lock:
-            cached = self.cache.get_json("whois_refer", key)
-            if cached is not None:
-                return cached or None
-            text = await self._raw_whois("whois.iana.org", tld)
-            server = ""
-            if text:
-                m = re.search(r"^(?:refer|whois):\s*(\S+)", text, re.M | re.I)
-                server = m.group(1).strip().lower() if m else ""
-            if text is not None:
-                self.cache.set_json("whois_refer", key, server, TTL["whois_refer"])
-            return server or None
-
     async def whois(self, domain: str, tld: str) -> RegistrationInfo:
         """
         WHOIS lookup with thin-registry referral support.
@@ -524,22 +380,22 @@ class RegistrationLookup:
             domain (str): ASCII domain.
             tld (str): Top-level domain.
         Returns:
-            RegistrationInfo: Parsed record (error set on failure).
+            RegistrationInfo: Parsed record (error set when unavailable).
         """
-        server = await self.whois_server(tld)
+        server = await self.whois_client.server_for(tld)
         if not server:
-            return RegistrationInfo(source="whois", error="no WHOIS server for TLD")
+            return RegistrationInfo(source="whois", error="no WHOIS service for this TLD")
         query = f"-T dn,ace {domain}" if server == "whois.denic.de" else domain
-        text = await self._raw_whois(server, query)
+        text = await self.whois_client.query(server, query)
         if text is None:
-            return RegistrationInfo(source="whois", server=server, error="WHOIS server unreachable")
+            return RegistrationInfo(source="whois", server=server, error="WHOIS not available")
         info = parse_whois(text, domain)
         info.server = server
         m = re.search(r"Registrar WHOIS Server:\s*(\S+)", text, re.I)
         if info.registered and m and not info.registrant_org:
             referral = m.group(1).strip().lower().removeprefix("whois://").rstrip("/")
             if referral and referral != server and "." in referral:
-                text2 = await self._raw_whois(referral, domain)
+                text2 = await self.whois_client.query(referral, domain)
                 if text2:
                     extra = parse_whois(text2, domain)
                     info.registrant_org = extra.registrant_org
@@ -547,3 +403,12 @@ class RegistrationLookup:
                     info.registrant_country = info.registrant_country or extra.registrant_country
                     info.privacy = info.privacy or extra.privacy
         return info
+
+    def status(self) -> str:
+        """
+        Service status line (delegates to the WHOIS client).
+
+        Returns:
+            str: Status text for the UI.
+        """
+        return self.whois_client.status()

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -20,7 +20,7 @@ def utcnow() -> datetime:
     Returns:
         datetime: Now, in UTC.
     """
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -356,6 +356,28 @@ class ScoreItem:
 
 
 @dataclass(slots=True)
+class SubdomainInfo:
+    """
+    A subdomain observed under a lookalike domain.
+
+    Attributes:
+        name (str): Full hostname, e.g. "login.examp1e.com".
+        sources (set[str]): Where it was seen: "ct", "dns", "feed".
+        ips (list[str]): Resolved addresses (empty if not resolved).
+        brand (bool): A label impersonates the target brand
+            (e.g. "example.it.secure-login.com").
+        credential (bool): A label is credential/payment themed
+            ("login", "secure", "account", "pay", ...).
+    """
+
+    name: str
+    sources: set[str] = field(default_factory=set)
+    ips: list[str] = field(default_factory=list)
+    brand: bool = False
+    credential: bool = False
+
+
+@dataclass(slots=True)
 class Candidate:
     """
     A lookalike domain and everything learnt about it.
@@ -376,6 +398,8 @@ class Candidate:
         urlscan (UrlscanInfo | None): urlscan.io data.
         feeds (set[str]): Threat feeds listing the domain itself.
         feed_subdomains (set[str]): Feeds listing only subdomains of it.
+        subdomains (list[SubdomainInfo]): Subdomains found (CT, DNS, feeds).
+        wildcard_dns (bool): Every subdomain resolves ("*.domain" record).
         page (PageInfo | None): Web content analysis.
         visual (VisualMatch | None): Logo / screenshot similarity.
         text_similarity (float): TF-IDF similarity with the target site.
@@ -403,6 +427,8 @@ class Candidate:
     urlscan: UrlscanInfo | None = None
     feeds: set[str] = field(default_factory=set)
     feed_subdomains: set[str] = field(default_factory=set)
+    subdomains: list[SubdomainInfo] = field(default_factory=list)
+    wildcard_dns: bool = False
     page: PageInfo | None = None
     visual: VisualMatch | None = None
     text_similarity: float = 0.0
@@ -434,6 +460,33 @@ class Candidate:
             int: Score 0-100 (0 when unknown).
         """
         return max((a.score for a in self.abuse), default=0)
+
+    def add_subdomain(self, name: str, source: str, *, brand: bool = False,
+                      credential: bool = False, ips: list[str] | None = None) -> SubdomainInfo:
+        """
+        Record a subdomain, merging with an existing entry of the same name.
+
+        Args:
+            name (str): Full hostname.
+            source (str): "ct", "dns" or "feed".
+            brand (bool): Impersonates the brand.
+            credential (bool): Credential/payment themed.
+            ips (list[str] | None): Resolved addresses.
+        Returns:
+            SubdomainInfo: The (new or merged) entry.
+        """
+        for sub in self.subdomains:
+            if sub.name == name:
+                break
+        else:
+            sub = SubdomainInfo(name=name)
+            self.subdomains.append(sub)
+        sub.sources.add(source)
+        sub.brand = sub.brand or brand
+        sub.credential = sub.credential or credential
+        if ips:
+            sub.ips = sorted(set(sub.ips) | set(ips))
+        return sub
 
 
 @dataclass(slots=True)

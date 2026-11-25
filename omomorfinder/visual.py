@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageStat
 
+from . import activity
 from .config import TTL, Settings
 from .models import ImageFingerprint, VisualMatch
 from .net import HttpClient
@@ -409,6 +410,7 @@ class Screenshotter:
         async with self._sem:
             page = await self._context.new_page()
             try:
+                activity.emit("browser", f"chromium --headless --screenshot={path.name} {url}")
                 await page.goto(url, timeout=20_000, wait_until="load")
                 await page.wait_for_timeout(1200)
                 await page.screenshot(path=str(path), full_page=False)

@@ -139,7 +139,7 @@ class Settings:
     max_image_bytes: int = 1_500_000
     vt_limit: int = 25
     abuse_limit: int = 80
-    whois_limit: int = 80
+    whois_limit: int = 40
     ct_enabled: bool = True
     use_cache: bool = True
     include_mixed_script: bool = False
@@ -216,8 +216,6 @@ class Settings:
 DEFAULT_RATE = RateRule(min_interval=0.35, jitter=0.35, concurrency=3)
 # RDAP servers are shared by many domains, keep them gentle.
 RDAP_RATE = RateRule(min_interval=0.5, jitter=0.3, concurrency=3)
-# Port-43 WHOIS servers are the most aggressive at banning.
-WHOIS_RATE = RateRule(min_interval=1.5, jitter=0.6, concurrency=1)
 
 # Cache time-to-live values, in seconds.
 TTL = {

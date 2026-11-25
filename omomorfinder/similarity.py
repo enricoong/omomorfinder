@@ -147,7 +147,7 @@ def jaro_winkler(a: str, b: str, prefix_scale: float = 0.1) -> float:
     m = float(matches)
     jaro = (m / la + m / lb + (m - transpositions / 2) / m) / 3
     prefix = 0
-    for x, y in zip(a[:4], b[:4]):
+    for x, y in zip(a[:4], b[:4], strict=False):
         if x != y:
             break
         prefix += 1

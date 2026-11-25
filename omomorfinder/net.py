@@ -25,8 +25,31 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from . import activity
 from .cache import Cache
 from .config import DEFAULT_RATE, RDAP_RATE, RateRule, Settings
+
+# Hosts of the threat-intelligence APIs (activity feed classification).
+_INTEL_HOSTS = ("virustotal.com", "abuseipdb.com", "urlscan.io")
+
+
+def activity_kind(host: str, url: str = "") -> str:
+    """
+    Classify an HTTP request for the live activity feed.
+
+    Args:
+        host (str): Request hostname.
+        url (str): Full URL (RDAP endpoints may live on generic hosts).
+    Returns:
+        str: "rdap", "ct", "intel" or "http".
+    """
+    if "rdap" in host or "/rdap/" in url:
+        return "rdap"
+    if host == "crt.sh":
+        return "ct"
+    if host.endswith(_INTEL_HOSTS):
+        return "intel"
+    return "http"
 
 log = logging.getLogger(__name__)
 
@@ -151,7 +174,7 @@ class HttpResult:
         }
 
     @classmethod
-    def from_meta(cls, meta: dict[str, Any], blob: bytes | None) -> "HttpResult":
+    def from_meta(cls, meta: dict[str, Any], blob: bytes | None) -> HttpResult:
         """
         Rebuild a result from cached metadata and body.
 
@@ -212,7 +235,7 @@ class HostLimiter:
         async with self._lock:
             self._next_slot = max(self._next_slot, time.monotonic() + seconds)
 
-    async def __aenter__(self) -> "HostLimiter":
+    async def __aenter__(self) -> HostLimiter:
         """
         Acquire a concurrency permit and wait for the next time slot.
 
@@ -434,6 +457,7 @@ class HttpClient:
             started = time.monotonic()
             result = HttpResult(url=url, tls_verified=verify)
             async with limiter:
+                activity.emit(activity_kind(host, url), activity.curl_command(method, url, params, headers, verify))
                 try:
                     async with asyncio.timeout(deadline):
                         async with client.stream(

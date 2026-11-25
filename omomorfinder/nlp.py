@@ -19,6 +19,8 @@ import re
 from collections import Counter
 from typing import Any
 
+from . import activity
+
 log = logging.getLogger(__name__)
 
 TOKEN_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
@@ -206,6 +208,7 @@ class EmbeddingModel:
             return {}
         ids = list(others)
         texts = [reference[:4000]] + [others[i][:4000] for i in ids]
+        activity.emit("nlp", f"embed {len(texts)} pages with {self.model_name.rsplit('/', 1)[-1]}")
 
         def encode() -> list[float]:
             """
@@ -223,4 +226,4 @@ class EmbeddingModel:
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             return {}
-        return {i: round(s, 4) for i, s in zip(ids, sims)}
+        return {i: round(s, 4) for i, s in zip(ids, sims, strict=True)}

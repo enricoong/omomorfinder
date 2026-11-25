@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 from . import __app_name__, __version__
-from .engine import ScanResult
+from .pipeline import ScanResult
 from .models import Candidate, to_jsonable
 
 CSV_FIELDS: tuple[str, ...] = (
@@ -19,7 +19,7 @@ CSV_FIELDS: tuple[str, ...] = (
     "registered", "created", "registrar", "registrant", "ips", "mx", "ns", "web_status", "final_url",
     "title", "password_form", "login_form", "brand_mentions", "logo_similarity", "favicon_match",
     "text_similarity", "semantic_similarity", "vt_malicious", "abuse_score", "feeds", "ct_certs",
-    "parked", "web_filtered", "reasons",
+    "parked", "web_filtered", "subdomains", "brand_subdomains", "wildcard_dns", "reasons",
 )
 
 
@@ -65,6 +65,9 @@ def csv_row(rank: int, c: Candidate) -> dict[str, object]:
         "vt_malicious": c.vt.malicious if c.vt else "", "abuse_score": c.max_abuse or "",
         "feeds": " ".join(sorted(c.feeds)), "ct_certs": c.ct.count if c.ct else "",
         "parked": bool(p and p.parked), "web_filtered": bool(p and p.filtered),
+        "subdomains": " ".join(sd.name for sd in c.subdomains),
+        "brand_subdomains": " ".join(sd.name for sd in c.subdomains if sd.brand),
+        "wildcard_dns": c.wildcard_dns,
         "reasons": " | ".join(f"{i.points:+.0f} {i.label}" for i in c.breakdown),
     }
 
